@@ -14,8 +14,6 @@ import org.jxmpp.stringprep.XmppStringprepException;
 import java.util.ArrayList;
 import java.util.List;
 
-import static com.smack.example.model.Admin.userIdToJid;
-
 
 public class ChatBotService {
 
@@ -32,8 +30,6 @@ public class ChatBotService {
     private static int difficult = 4;
 
     private Admin admin;
-
-    private MultiUserChat currentRoom;
 
     private List<Bot> bots;
 
@@ -71,13 +67,10 @@ public class ChatBotService {
         }
     }
 
-    public void createNewConference() {
-        for (int i = 1; i <= 50; i++) {
+    public void createNewConference(int numberMembers, String roomId, String password, boolean needTrack) {
+        for (int i = 1; i <= numberMembers; i++) {
             registerChatAccount(String.format("bot%d", i));
         }
-
-        String roomId = String.valueOf(System.currentTimeMillis());
-        String password = "1234";
 
         RoomProperties newRoom = new RoomProperties(
                 roomId,
@@ -85,24 +78,28 @@ public class ChatBotService {
                 admin.getNickname()
         );
 
-        currentRoom = admin.createRoom(newRoom, true);
+        MultiUserChat currentRoom = admin.createRoom(newRoom, needTrack);
+
+        if (currentRoom == null) {
+            return;
+        }
         List<String> jids = new ArrayList<>();
 
         for (Bot bot : bots) {
-            try {
-                bot.run();
-                jids.add(userIdToJid(bot.getUsername()));
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+            bot.run();
+            jids.add(bot.userIdToJid());
         }
 
         admin.inviteUsers(currentRoom, jids, "join");
     }
 
+
     public static void main(String[] args) throws XmppStringprepException {
         ChatBotService service = new ChatBotService();
         service.init();
-        service.createNewConference();
+
+        String roomId = String.valueOf(System.currentTimeMillis());
+        String password = "1234";
+        service.createNewConference(100, roomId, password, true);
     }
 }

@@ -86,6 +86,7 @@ public class Bot implements Runnable, ConnectionListener {
 
     @Override
     public void run() {
+        logger.info("I'm " + username);
         start();
     }
 
@@ -218,6 +219,7 @@ public class Bot implements Runnable, ConnectionListener {
         try {
             running.await();
             connection.disconnect();
+            logger.info("Exit successful");
         } catch (InterruptedException ignored) {
 
         } finally {
@@ -268,6 +270,10 @@ public class Bot implements Runnable, ConnectionListener {
 
     public String getNickname() {
         return nickname;
+    }
+
+    public String userIdToJid() {
+        return username + "@" + service;
     }
 
 }

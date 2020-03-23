@@ -34,6 +34,7 @@ public class Admin implements ConnectionListener {
     public static String host = "msg.beowulfchain.com";
     public static int port = 443;
     public static String service = "beowulfchain.com";
+    public static String trackDir = "./track";
 
     private final Lock lock;
     private final Condition running;
@@ -65,11 +66,16 @@ public class Admin implements ConnectionListener {
         if (roomsString == null) {
             createdRooms = new ArrayList<>();
         } else {
-            createdRooms = getCreateRooms(roomsString);
+            createdRooms = getCreatedRooms(roomsString);
         }
 
         groupChatsByRoomId = new ConcurrentHashMap<>();
         trackersByRoomId = new ConcurrentHashMap<>();
+
+        File directory = new File(trackDir);
+        if (!directory.exists()) {
+            directory.mkdir();
+        }
         timer = new Timer();
     }
 
@@ -85,7 +91,7 @@ public class Admin implements ConnectionListener {
                 .build();
     }
 
-    private List<RoomProperties> getCreateRooms(String roomsString) {
+    private List<RoomProperties> getCreatedRooms(String roomsString) {
         return null;
     }
 
@@ -125,7 +131,8 @@ public class Admin implements ConnectionListener {
     /**
      * Create and join a conference room
      *
-     * @param room room info for create (part before the "@conference_host"
+     * @param room      room info for create (part before the "@conference_host"
+     * @param needTrack flag for tracking message in new room
      */
     public MultiUserChat createRoom(RoomProperties room, boolean needTrack) {
         logger.info("Create room \"{}\"", room.getRoomId());
@@ -169,10 +176,18 @@ public class Admin implements ConnectionListener {
         return null;
     }
 
-    public static String userIdToJid(String userId) {
-        return userId + "@" + service;
+    public String userIdToJid() {
+        return username + "@" + service;
     }
 
+    /**
+     * Invite list of users to group chat
+     *
+     * @param groupChat the MultiUserChat group chat to send the message to
+     * @param jids      the list jid of users
+     * @param reason    the message in invitation
+     * @return list of user can not join the room
+     */
     public List<String> inviteUsers(MultiUserChat groupChat, List<String> jids, String reason) {
         List<String> errors = new ArrayList<>();
 
@@ -262,12 +277,19 @@ public class Admin implements ConnectionListener {
         }
     }
 
+    /**
+     * Create new message tracker for group chat
+     *
+     * @param roomId the id of room need to track
+     */
     private void createTracker(String roomId) {
         try {
             if (!trackersByRoomId.containsKey(roomId)) {
                 lock.tryLock(2, TimeUnit.SECONDS);
-                File file = new File(roomId);
-                if (!file.exists()) {
+
+                String fileName = trackDir + "/" + roomId;
+                File file = new File(fileName);
+                if (!file.createNewFile()) {
                     file.createNewFile();
                 }
 
@@ -310,6 +332,7 @@ public class Admin implements ConnectionListener {
                 trackersByRoomId.get(roomId).close();
             }
             trackersByRoomId.clear();
+            logger.info("Exit successful");
 
         } catch (InterruptedException ignored) {
 
@@ -365,45 +388,23 @@ public class Admin implements ConnectionListener {
         return nickname;
     }
 
-    public List<String> getMembers(String roomID) throws Exception {
+    public List<String> getMembers(String roomId) throws Exception {
         List<String> users = new ArrayList<String>();
 
-        for (Occupant occupant : groupChatsByRoomId.get(roomID).getParticipants()) {
-            users.add(occupant.getJid().toString());
+        if (groupChatsByRoomId.containsKey(roomId)) {
+            for (Occupant occupant : groupChatsByRoomId.get(roomId).getParticipants()) {
+                users.add(occupant.getJid().toString());
+            }
         }
 
         return users;
     }
 
-    public static void main(String[] args) {
-        try {
-            Admin admin = new Admin("25251325", "123456789", "Admin", null);
-            admin.start();
-
-            String roomId = String.valueOf(System.currentTimeMillis());
-            String password = "1234";
-
-            RoomProperties newRoom = new RoomProperties(
-                    roomId,
-                    password,
-                    admin.nickname
-            );
-
-            MultiUserChat newGroupChat = admin.createRoom(newRoom, true);
-
-            Bot bot1 = new Bot("123456789a", "123456789", "Bot1", null);
-            Bot bot2 = new Bot("1234567897", "123456789", "Bot2", null);
-            bot1.run();
-            bot2.run();
-
-            List<String> jids = new ArrayList<>();
-            jids.add(userIdToJid(bot1.getUsername()));
-            jids.add(userIdToJid(bot2.getUsername()));
-
-            admin.inviteUsers(newGroupChat, jids, "join");
-
-        } catch (Exception e) {
-            e.printStackTrace();
+    public Integer getMembersCount(String roomId) {
+        if (groupChatsByRoomId.containsKey(roomId)) {
+            return groupChatsByRoomId.get(roomId).getOccupantsCount();
         }
+        return 0;
     }
+
 }
