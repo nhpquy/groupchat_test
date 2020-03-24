@@ -100,6 +100,6 @@ public class ChatBotService {
 
         String roomId = String.valueOf(System.currentTimeMillis());
         String password = "1234";
-        service.createNewConference(100, roomId, password, true);
+        service.createNewConference(100, roomId, password, false);
     }
 }

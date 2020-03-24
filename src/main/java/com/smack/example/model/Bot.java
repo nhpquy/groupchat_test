@@ -33,7 +33,7 @@ public class Bot implements Runnable, ConnectionListener {
 
     private final Lock lock;
     private final Condition running;
-    private final XMPPTCPConnection connection;
+    private final AbstractXMPPConnection connection;
     private ChatManager chatManager;
     private MultiUserChatManager multiUserChatManager;
 
@@ -95,6 +95,7 @@ public class Bot implements Runnable, ConnectionListener {
      */
     private void start() {
         try {
+            connection.setReplyTimeout(120000);
             connection.connect();
 
             if (connection.isConnected())

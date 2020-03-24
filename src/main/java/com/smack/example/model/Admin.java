@@ -38,7 +38,7 @@ public class Admin implements ConnectionListener {
 
     private final Lock lock;
     private final Condition running;
-    private final XMPPTCPConnection connection;
+    private final AbstractXMPPConnection connection;
     private MultiUserChatManager multiUserChatManager;
 
     private String username;
@@ -100,6 +100,7 @@ public class Admin implements ConnectionListener {
      */
     public void start() {
         try {
+            connection.setReplyTimeout(120000);
             connection.connect();
 
             if (connection.isConnected())
