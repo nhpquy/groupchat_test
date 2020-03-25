@@ -10,6 +10,7 @@ import org.jivesoftware.smack.tcp.XMPPTCPConnection;
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration;
 import org.jivesoftware.smackx.muc.MultiUserChat;
 import org.jivesoftware.smackx.muc.MultiUserChatManager;
+import org.jivesoftware.smackx.ping.PingManager;
 import org.jxmpp.jid.EntityBareJid;
 import org.jxmpp.jid.impl.JidCreate;
 import org.jxmpp.jid.parts.Resourcepart;
@@ -25,28 +26,32 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class Bot implements Runnable, ConnectionListener {
 
-    private static final Logger logger = LogManager.getLogger(Bot.class);
+    private Logger logger;
 
-    public static String host = "msg.beowulfchain.com";
-    public static int port = 443;
-    public static String service = "beowulfchain.com";
+    private static String host = "msg.beowulfchain.com";
+    private static int port = 443;
+    private static String service = "beowulfchain.com";
+    private static int connectionTimeout = 5000; //mills
+    private static int pingTimeout = 5; // seconds
+
 
     private final Lock lock;
     private final Condition running;
-    private final AbstractXMPPConnection connection;
-    private ChatManager chatManager;
+
+    private AbstractXMPPConnection connection;
     private MultiUserChatManager multiUserChatManager;
+    private PingManager pingManager;
 
     private String username;
     private String password;
     private String nickname;
 
-    private List<RoomProperties> rooms;
+    private List<RoomProperties> joinedRooms;
     private ConcurrentHashMap<String, MultiUserChat> groupChatsByRoomId;
 
     private Timer timer;
 
-    public Bot(String username, String password, String nickname, String roomsString) throws XmppStringprepException {
+    public Bot(String username, String password, String nickname, String roomsString) {
 
         lock = new ReentrantLock();
         running = lock.newCondition();
@@ -55,13 +60,13 @@ public class Bot implements Runnable, ConnectionListener {
         this.password = password;
         this.nickname = nickname;
 
-        this.connection = new XMPPTCPConnection(initSmackConfig());
+        logger = LogManager.getLogger(nickname);
 
         // Load joined rooms
         if (roomsString == null) {
-            rooms = Collections.emptyList();
+            joinedRooms = new ArrayList<>();
         } else {
-            rooms = getCreateRooms(roomsString);
+            joinedRooms = getJoinedRooms(roomsString);
         }
 
         groupChatsByRoomId = new ConcurrentHashMap<>();
@@ -77,17 +82,19 @@ public class Bot implements Runnable, ConnectionListener {
                 .setSecurityMode(ConnectionConfiguration.SecurityMode.required)
                 .setSendPresence(true)
                 .addEnabledSaslMechanism(Arrays.asList("PLAIN", "X-OAUTH2", "SCRAM-SHA-1"))
+                .setConnectTimeout(connectionTimeout)
                 .build();
     }
 
-    private List<RoomProperties> getCreateRooms(String roomsString) {
+    private List<RoomProperties> getJoinedRooms(String roomsString) {
         return null;
     }
 
     @Override
     public void run() {
-        logger.info("I'm " + username);
+        logger.info("I'm " + nickname);
         start();
+        setMessageScheduler(5000L);
     }
 
     /**
@@ -95,33 +102,32 @@ public class Bot implements Runnable, ConnectionListener {
      */
     private void start() {
         try {
-            connection.setReplyTimeout(120000);
-            connection.connect();
+            connect();
 
-            if (connection.isConnected())
-                logger.info("Smack Message Client connected to server: " + host + ":" + port);
-
-            connection.login();
-
-            if (connection.isAuthenticated())
-                logger.info("Smack Message Client authenticated: username=" + username + "; password=XXXXXXXXXXXX");
-
-            chatManager = ChatManager.getInstanceFor(connection);
+            ChatManager chatManager = ChatManager.getInstanceFor(connection);
             chatManager.addIncomingListener((EntityBareJid from, Message message, Chat chat) -> {
                 logger.info("Received private message: " + message.getBody());
             });
 
+            connection.addConnectionListener(this);
+
+            pingManager = PingManager.getInstanceFor(connection);
+            pingManager.setPingInterval(pingTimeout);
+
+            ReconnectionManager reconnectionManager = ReconnectionManager.getInstanceFor(connection);
+            reconnectionManager.enableAutomaticReconnection();
+            reconnectionManager.setReconnectionPolicy(ReconnectionManager.ReconnectionPolicy.FIXED_DELAY);
+            reconnectionManager.setFixedDelay(10);
+
             multiUserChatManager = MultiUserChatManager.getInstanceFor(connection);
 
-            rooms.forEach(this::joinRoom);
+            joinedRooms.forEach(this::joinRoom);
 
             multiUserChatManager.addInvitationListener((conn, room, inviter, reason, password, message, invitation) -> {
                 String roomId = room.getRoom().getLocalpart().toString();
                 logger.info("Received invitation to room: " + roomId + " - passcode: " + password + " - " + reason);
                 joinRoom(new RoomProperties(roomId, password, nickname));
             });
-
-            setMessageScheduler(5000L);
 
         } catch (XMPPException e) {
             throw new RuntimeException("XMPP Error", e);
@@ -136,31 +142,67 @@ public class Bot implements Runnable, ConnectionListener {
     }
 
     /**
+     * Connects to XMPP server
+     */
+    private void connect() throws IOException, InterruptedException, XMPPException, SmackException {
+
+        connection = new XMPPTCPConnection(initSmackConfig());
+
+        if (connection.isConnected()) return;
+
+        connection.setReplyTimeout(5000L);
+        connection.connect();
+
+        if (connection.isConnected())
+            logger.info("Smack Message Client connected to server: " + host + ":" + port);
+
+        connection.login();
+
+        if (connection.isAuthenticated())
+            logger.info("Smack Message Client authenticated: username=" + username);
+    }
+
+    private boolean isConnected() throws SmackException.NotConnectedException, InterruptedException {
+        return pingManager.pingMyServer();
+    }
+
+    /**
      * Join a room
      *
      * @param room room to join (part before the "@conference_host"
      */
-    private void joinRoom(RoomProperties room) {
+    public void joinRoom(RoomProperties room) {
         logger.info("Join room \"{}\"", room.getRoomId());
 
-        if (groupChatsByRoomId.containsKey(room.getRoomId())) {
-            logger.info("Already in this room");
+        MultiUserChat groupChat;
+        if ((groupChat = groupChatsByRoomId.get(room.getRoomId())) != null) {
+            if (groupChat.isJoined()) {
+                logger.info("Already in this room");
+            } else {
+                try {
+                    groupChat.join(Resourcepart.from(nickname), room.getPasscode());
+                    logger.info("\"{}\" joined room \"{}\"", nickname, room.getRoomId());
+                } catch (Exception e) {
+                    logger.error("Error joining room", e);
+                }
+            }
         } else {
             try {
                 lock.lock();
                 EntityBareJid jid = JidCreate.entityBareFrom(room.getRoomId() + "@conference." + service);
-                MultiUserChat muc = multiUserChatManager.getMultiUserChat(jid);
-                muc.join(Resourcepart.from(room.getNickName()), room.getPasscode());
-                groupChatsByRoomId.put(room.getRoomId(), muc);
-                logger.info("Room joined");
-
+                groupChat = multiUserChatManager.getMultiUserChat(jid);
+                groupChat.join(Resourcepart.from(nickname), room.getPasscode());
+                groupChatsByRoomId.put(room.getRoomId(), groupChat);
+                logger.info("\"{}\" joined room \"{}\"", nickname, room.getRoomId());
+                joinedRooms.add(room);
             } catch (Exception e) {
-                logger.error("Error joining room: " + e.getMessage());
+                logger.error("Error joining room", e);
             } finally {
                 lock.unlock();
             }
         }
     }
+
 
     /**
      * Set schedule for sending a message to a multi user chat
@@ -171,15 +213,26 @@ public class Bot implements Runnable, ConnectionListener {
         timer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
-                String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
-                sendMessageToAllGroups(message);
+                try {
+                    if (!isConnected()) return;
+                    DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
+                    String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
+                    sendMessageToAllGroups(message);
+                } catch (SmackException.NotConnectedException | InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
         }, Calendar.getInstance().getTime(), interval);
     }
 
+    /**
+     * Send message to all joined room
+     *
+     * @param message the message to send
+     */
     private void sendMessageToAllGroups(String message) {
         for (String roomId : groupChatsByRoomId.keySet()) {
+            logger.debug("\"{}\" send message to room \"{}\"", nickname, roomId);
             sendMessage(groupChatsByRoomId.get(roomId), message);
         }
     }
@@ -218,11 +271,8 @@ public class Bot implements Runnable, ConnectionListener {
     public void waitForExit() {
         lock.lock();
         try {
-            running.await();
             connection.disconnect();
             logger.info("Exit successful");
-        } catch (InterruptedException ignored) {
-
         } finally {
             lock.unlock();
         }
@@ -244,6 +294,7 @@ public class Bot implements Runnable, ConnectionListener {
     @Override
     public void connected(XMPPConnection connection) {
         logger.info("Connected to server");
+        joinedRooms.forEach(this::joinRoom);
     }
 
     @Override
@@ -254,11 +305,12 @@ public class Bot implements Runnable, ConnectionListener {
     @Override
     public void connectionClosed() {
         logger.info("Connection closed");
+        exit();
     }
 
     @Override
     public void connectionClosedOnError(Exception e) {
-        logger.error("Connection was closed because of an error", e);
+        logger.error("Connection was closed because of an error: " + e.getMessage());
     }
 
     public String getUsername() {

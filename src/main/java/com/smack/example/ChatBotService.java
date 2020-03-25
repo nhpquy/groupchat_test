@@ -13,6 +13,9 @@ import org.jxmpp.stringprep.XmppStringprepException;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Scanner;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 
 public class ChatBotService {
@@ -27,11 +30,13 @@ public class ChatBotService {
 
     private static final String defaultPwd = "123456789";
 
+    private static final int MAX_T = 5;
+
     private static int difficult = 4;
 
-    private Admin admin;
+    private static Admin admin;
 
-    private List<Bot> bots;
+    private static List<Bot> bots;
 
     public ChatBotService() {
     }
@@ -39,7 +44,9 @@ public class ChatBotService {
     private void init() throws XmppStringprepException {
         admin = new Admin("25251325", "123456789", "Admin", null);
         admin.start();
+
         bots = new ArrayList<>();
+        generateBots(10);
     }
 
     private void registerChatAccount(String nickName) {
@@ -58,7 +65,7 @@ public class ChatBotService {
             }
 
             if (response.contains("successfully")) {
-                logger.info(response);
+                logger.info(response + ": " + nickName);
                 bots.add(new Bot(request.getChatId(), request.getPassword(), nickName, null));
             }
         } catch (Exception e) {
@@ -67,10 +74,16 @@ public class ChatBotService {
         }
     }
 
-    public void createNewConference(int numberMembers, String roomId, String password, boolean needTrack) {
-        for (int i = 1; i <= numberMembers; i++) {
-            registerChatAccount(String.format("bot%d", i));
+    private void generateBots(int numberOfMembers) {
+        while (bots.size() < numberOfMembers) {
+            registerChatAccount(String.format("bot%d", bots.size()));
+            bots.get(bots.size() - 1).run();
         }
+    }
+
+    public void createNewConference(int numberOfMembers, String roomId, String password, boolean needTrack) {
+
+        generateBots(numberOfMembers);
 
         RoomProperties newRoom = new RoomProperties(
                 roomId,
@@ -83,14 +96,54 @@ public class ChatBotService {
         if (currentRoom == null) {
             return;
         }
-        List<String> jids = new ArrayList<>();
 
-        for (Bot bot : bots) {
-            bot.run();
-            jids.add(bot.userIdToJid());
+        ExecutorService botPool = Executors.newFixedThreadPool(MAX_T);
+
+        for (int i = 0; i < numberOfMembers; i++) {
+            int finalI = i;
+            Runnable joinRoomTask = () -> bots.get(finalI).joinRoom(newRoom);
+            botPool.execute(joinRoomTask);
+        }
+        System.out.println("Created room with ID: " + roomId + "successfully");
+    }
+
+    public void inviteToNewConference(int numberOfMembers, String roomId, String password, boolean needTrack) {
+
+        generateBots(numberOfMembers);
+
+        RoomProperties newRoom = new RoomProperties(
+                roomId,
+                password,
+                admin.getNickname()
+        );
+
+        MultiUserChat currentRoom = admin.createRoom(newRoom, needTrack);
+
+        if (currentRoom == null) {
+            return;
         }
 
-        admin.inviteUsers(currentRoom, jids, "join");
+        ExecutorService botPool = Executors.newFixedThreadPool(MAX_T);
+
+        for (int i = 0; i < numberOfMembers; i++) {
+            int finalI = i;
+            Runnable inviteTask = () -> admin.sendInvitation(currentRoom, bots.get(finalI).userIdToJid(), "join");
+            botPool.execute(inviteTask);
+        }
+
+        System.out.println("Created room with ID: " + roomId + "successfully");
+    }
+
+    private static void onDestroy() {
+        try {
+            admin.waitForExit();
+
+            for (Bot bot : bots) {
+                bot.waitForExit();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
 
@@ -98,8 +151,41 @@ public class ChatBotService {
         ChatBotService service = new ChatBotService();
         service.init();
 
-        String roomId = String.valueOf(System.currentTimeMillis());
-        String password = "1234";
-        service.createNewConference(100, roomId, password, false);
+        System.out.println("\n");
+        System.out.println("- [-create <passcode> <number of members>] - create new room with your passcode");
+        System.out.println("- [-invite <passcode> <number of members>] - invite list user to new room with your passcode");
+        System.out.println("- [-rooms] - list rooms");
+        System.out.println("- [exit] - exit");
+
+        Scanner in = new Scanner(System.in);
+        while (true) {
+            System.out.println("\nEnter command to continue:");
+            String input = in.nextLine();
+            if (input == null || "".equals(input))
+                continue;
+            if ("exit".equals(input)) {
+                onDestroy();
+                return;
+            }
+            if ("\n".equals(input))
+                continue;
+
+            String[] params = input.split(" ");
+            if ("-rooms".equals(params[0])) {
+                for (RoomProperties room : admin.getCreatedRooms()) {
+                    System.out.println("- " + room.getRoomId() + ": " + admin.getMembersCount(room.getRoomId()));
+                }
+            } else if ("-create".equals(params[0])) {
+                String roomId = String.valueOf(System.currentTimeMillis());
+                String passcode = (params.length >= 2) ? params[1] : "1234";
+                int numberOfMembers = (params.length >= 3) ? Integer.parseInt(params[2]) : 100;
+                service.createNewConference(numberOfMembers, roomId, passcode, true);
+            } else if ("-invite".equals(params[0])) {
+                String roomId = String.valueOf(System.currentTimeMillis());
+                String passcode = (params.length >= 2) ? params[1] : "1234";
+                int numberOfMembers = (params.length >= 3) ? Integer.parseInt(params[2]) : 100;
+                service.inviteToNewConference(numberOfMembers, roomId, passcode, true);
+            }
+        }
     }
 }

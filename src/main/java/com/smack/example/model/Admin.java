@@ -9,6 +9,7 @@ import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration;
 import org.jivesoftware.smackx.muc.MultiUserChat;
 import org.jivesoftware.smackx.muc.MultiUserChatManager;
 import org.jivesoftware.smackx.muc.Occupant;
+import org.jivesoftware.smackx.ping.PingManager;
 import org.jivesoftware.smackx.xdata.Form;
 import org.jxmpp.jid.EntityBareJid;
 import org.jxmpp.jid.impl.JidCreate;
@@ -22,7 +23,6 @@ import java.io.IOException;
 import java.text.DateFormat;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -34,12 +34,15 @@ public class Admin implements ConnectionListener {
     public static String host = "msg.beowulfchain.com";
     public static int port = 443;
     public static String service = "beowulfchain.com";
+    public static int connectionTimeout = 300000;
+    private static int pingTimeout = 5; // seconds
     public static String trackDir = "./track";
 
     private final Lock lock;
     private final Condition running;
     private final AbstractXMPPConnection connection;
     private MultiUserChatManager multiUserChatManager;
+    private PingManager pingManager;
 
     private String username;
     private String password;
@@ -88,6 +91,7 @@ public class Admin implements ConnectionListener {
                 .setSecurityMode(ConnectionConfiguration.SecurityMode.required)
                 .setSendPresence(true)
                 .addEnabledSaslMechanism(Arrays.asList("PLAIN", "X-OAUTH2", "SCRAM-SHA-1"))
+                .setConnectTimeout(connectionTimeout)
                 .build();
     }
 
@@ -100,6 +104,8 @@ public class Admin implements ConnectionListener {
      */
     public void start() {
         try {
+            if (connection.isConnected()) return;
+
             connection.setReplyTimeout(120000);
             connection.connect();
 
@@ -110,6 +116,16 @@ public class Admin implements ConnectionListener {
 
             if (connection.isAuthenticated())
                 logger.info("Smack Message Client authenticated: username=" + username + "; password=XXXXXXXXXXXX");
+
+            connection.addConnectionListener(this);
+
+            pingManager = PingManager.getInstanceFor(connection);
+            pingManager.setPingInterval(pingTimeout);
+
+            ReconnectionManager reConnectManager = ReconnectionManager.getInstanceFor(connection);
+            reConnectManager.enableAutomaticReconnection();
+            reConnectManager.setReconnectionPolicy(ReconnectionManager.ReconnectionPolicy.FIXED_DELAY);
+            reConnectManager.setFixedDelay(10);
 
             multiUserChatManager = MultiUserChatManager.getInstanceFor(connection);
 
@@ -126,7 +142,10 @@ public class Admin implements ConnectionListener {
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
 
+    private boolean isConnected() throws SmackException.NotConnectedException, InterruptedException {
+        return pingManager.pingMyServer();
     }
 
     /**
@@ -140,13 +159,13 @@ public class Admin implements ConnectionListener {
 
         try {
             if (!groupChatsByRoomId.containsKey(room.getRoomId())) {
-                lock.tryLock(3, TimeUnit.SECONDS);
-                EntityBareJid jid = JidCreate.entityBareFrom(room.getRoomId() + "@conference." + service);
+                lock.lock();
+
+                EntityBareJid jid = JidCreate.entityBareFrom(roomIdToJid(room.getRoomId()));
                 MultiUserChat muc = multiUserChatManager.getMultiUserChat(jid);
                 muc.create(Resourcepart.from(room.getNickName()));
 
                 Form form = muc.getConfigurationForm().createAnswerForm();
-
                 form.setAnswer("muc#roomconfig_roomname", room.getRoomName());
                 form.setAnswer("muc#roomconfig_persistentroom", true);
                 form.setAnswer("muc#roomconfig_publicroom", false);
@@ -158,12 +177,9 @@ public class Admin implements ConnectionListener {
 
                 joinRoom(room);
 
-                if (needTrack) {
-                    createTracker(room.getRoomId());
-                    muc.addMessageListener(message -> {
-                        handleTrackChatGroup(room.getRoomId(), message);
-                    });
-                }
+                if (needTrack) createTracker(room.getRoomId());
+
+                muc.addMessageListener(message -> handleTrackChatGroup(room.getRoomId(), message, needTrack));
 
                 return muc;
             }
@@ -179,6 +195,10 @@ public class Admin implements ConnectionListener {
 
     public String userIdToJid() {
         return username + "@" + service;
+    }
+
+    public String roomIdToJid(String roomId) {
+        return roomId + "@conference." + service;
     }
 
     /**
@@ -204,7 +224,7 @@ public class Admin implements ConnectionListener {
         return errors;
     }
 
-    private String sendInvitation(MultiUserChat groupChat, String userJID, String reason) {
+    public String sendInvitation(MultiUserChat groupChat, String userJID, String reason) {
         try {
             groupChat.invite(JidCreate.entityBareFrom(userJID), reason);
         } catch (Exception e) {
@@ -220,22 +240,31 @@ public class Admin implements ConnectionListener {
      *
      * @param room room to join (part before the "@conference_host"
      */
-    private void joinRoom(RoomProperties room) {
+    public void joinRoom(RoomProperties room) {
         logger.info("Join room \"{}\"", room.getRoomId());
 
-        if (groupChatsByRoomId.containsKey(room.getRoomId())) {
-            logger.info("Already in this room");
+        MultiUserChat groupChat;
+        if ((groupChat = groupChatsByRoomId.get(room.getRoomId())) != null) {
+            if (groupChat.isJoined()) {
+                logger.info("Already in this room");
+            } else {
+                try {
+                    groupChat.join(Resourcepart.from(nickname), room.getPasscode());
+                    logger.info("\"{}\" joined room \"{}\"", nickname, room.getRoomId());
+                } catch (Exception e) {
+                    logger.error("Error joining room", e);
+                }
+            }
         } else {
             try {
-                lock.tryLock(2, TimeUnit.SECONDS);
-                EntityBareJid jid = JidCreate.entityBareFrom(room.getRoomId() + "@conference." + service);
-                MultiUserChat muc = multiUserChatManager.getMultiUserChat(jid);
-                muc.join(Resourcepart.from(room.getNickName()), room.getPasscode());
-                groupChatsByRoomId.put(room.getRoomId(), muc);
-                logger.info("Room joined");
-
+                lock.lock();
+                EntityBareJid jid = JidCreate.entityBareFrom(roomIdToJid(room.getRoomId()));
+                groupChat = multiUserChatManager.getMultiUserChat(jid);
+                groupChat.join(Resourcepart.from(nickname), room.getPasscode());
+                groupChatsByRoomId.put(room.getRoomId(), groupChat);
+                logger.info("\"{}\" joined room \"{}\"", nickname, room.getRoomId());
             } catch (Exception e) {
-                logger.error("Error joining room: " + e.getMessage());
+                logger.error("Error joining room", e);
             } finally {
                 lock.unlock();
             }
@@ -251,9 +280,14 @@ public class Admin implements ConnectionListener {
         timer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
-                String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
-                sendMessageToAllGroups(message);
+                try {
+                    if (!isConnected()) return;
+                    DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
+                    String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
+                    sendMessageToAllGroups(message);
+                } catch (SmackException.NotConnectedException | InterruptedException ignored) {
+
+                }
             }
         }, Calendar.getInstance().getTime(), interval);
     }
@@ -285,8 +319,8 @@ public class Admin implements ConnectionListener {
      */
     private void createTracker(String roomId) {
         try {
+            lock.lock();
             if (!trackersByRoomId.containsKey(roomId)) {
-                lock.tryLock(2, TimeUnit.SECONDS);
 
                 String fileName = trackDir + "/" + roomId;
                 File file = new File(fileName);
@@ -307,16 +341,22 @@ public class Admin implements ConnectionListener {
         }
     }
 
-    private void handleTrackChatGroup(String roomId, Message message) {
-        try {
-            String record = String.format("%s: %s\n", message.getFrom().toString(), message.getBody());
-            if (!trackersByRoomId.containsKey(roomId)) {
-                createTracker(roomId);
+    private void handleTrackChatGroup(String roomId, Message message, boolean needTrack) {
+
+        String record = String.format("%s: %s\n", message.getFrom().toString(), message.getBody());
+
+        if (needTrack) {
+            try {
+                if (!trackersByRoomId.containsKey(roomId)) {
+                    createTracker(roomId);
+                }
+                trackersByRoomId.get(roomId).write(record);
+            } catch (Exception e) {
+                logger.error("Error when write chat record to file tracker");
+                e.printStackTrace();
             }
-            trackersByRoomId.get(roomId).write(record);
-        } catch (Exception e) {
-            logger.error("Error when write chat record to file tracker");
-            e.printStackTrace();
+        } else {
+            logger.debug(record);
         }
     }
 
@@ -326,7 +366,6 @@ public class Admin implements ConnectionListener {
     public void waitForExit() {
         lock.lock();
         try {
-            running.await();
             connection.disconnect();
 
             for (String roomId : trackersByRoomId.keySet()) {
@@ -334,8 +373,6 @@ public class Admin implements ConnectionListener {
             }
             trackersByRoomId.clear();
             logger.info("Exit successful");
-
-        } catch (InterruptedException ignored) {
 
         } catch (IOException e) {
             e.printStackTrace();
@@ -370,6 +407,7 @@ public class Admin implements ConnectionListener {
     @Override
     public void connectionClosed() {
         logger.info("Connection closed");
+        exit();
     }
 
     @Override
@@ -408,4 +446,7 @@ public class Admin implements ConnectionListener {
         return 0;
     }
 
+    public List<RoomProperties> getCreatedRooms() {
+        return createdRooms;
+    }
 }
