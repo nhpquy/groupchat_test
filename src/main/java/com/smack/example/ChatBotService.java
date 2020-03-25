@@ -165,7 +165,7 @@ public class ChatBotService {
                 continue;
             if ("exit".equals(input)) {
                 onDestroy();
-                return;
+                System.exit(0);
             }
             if ("\n".equals(input))
                 continue;

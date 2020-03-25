@@ -32,6 +32,7 @@ public class Bot implements Runnable, ConnectionListener {
     private static int port = 443;
     private static String service = "beowulfchain.com";
     private static int connectionTimeout = 5000; //mills
+    private static int packageTimeout = 30000; //mills
     private static int pingTimeout = 5; // seconds
 
 
@@ -150,7 +151,7 @@ public class Bot implements Runnable, ConnectionListener {
 
         if (connection.isConnected()) return;
 
-        connection.setReplyTimeout(5000L);
+        connection.setReplyTimeout(packageTimeout);
         connection.connect();
 
         if (connection.isConnected())
@@ -218,8 +219,8 @@ public class Bot implements Runnable, ConnectionListener {
                     DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
                     String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
                     sendMessageToAllGroups(message);
-                } catch (SmackException.NotConnectedException | InterruptedException e) {
-                    e.printStackTrace();
+                } catch (SmackException.NotConnectedException | InterruptedException ignored) {
+
                 }
             }
         }, Calendar.getInstance().getTime(), interval);

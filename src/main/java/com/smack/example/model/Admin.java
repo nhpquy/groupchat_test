@@ -31,10 +31,11 @@ public class Admin implements ConnectionListener {
 
     private static final Logger logger = LogManager.getLogger(Admin.class);
 
-    public static String host = "msg.beowulfchain.com";
-    public static int port = 443;
-    public static String service = "beowulfchain.com";
-    public static int connectionTimeout = 300000;
+    private static String host = "msg.beowulfchain.com";
+    private static int port = 443;
+    private static String service = "beowulfchain.com";
+    private static int connectionTimeout = 300000; //mills
+    private static int packageTimeout = 120000; //mills
     private static int pingTimeout = 5; // seconds
     public static String trackDir = "./track";
 
@@ -106,7 +107,7 @@ public class Admin implements ConnectionListener {
         try {
             if (connection.isConnected()) return;
 
-            connection.setReplyTimeout(120000);
+            connection.setReplyTimeout(packageTimeout);
             connection.connect();
 
             if (connection.isConnected())
@@ -170,6 +171,7 @@ public class Admin implements ConnectionListener {
                 form.setAnswer("muc#roomconfig_persistentroom", true);
                 form.setAnswer("muc#roomconfig_publicroom", false);
                 form.setAnswer("muc#roomconfig_passwordprotectedroom", true);
+                form.setAnswer("muc#roomconfig_maxusers", 2000);
                 form.setAnswer("muc#roomconfig_roomsecret", room.getPasscode());
                 muc.sendConfigurationForm(form);
 
