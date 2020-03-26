@@ -171,7 +171,7 @@ public class Admin implements ConnectionListener {
                 form.setAnswer("muc#roomconfig_persistentroom", true);
                 form.setAnswer("muc#roomconfig_publicroom", false);
                 form.setAnswer("muc#roomconfig_passwordprotectedroom", true);
-                form.setAnswer("muc#roomconfig_maxusers", 2000);
+                form.setAnswer("muc#roomconfig_maxusers", Collections.singletonList("2000"));
                 form.setAnswer("muc#roomconfig_roomsecret", room.getPasscode());
                 muc.sendConfigurationForm(form);
 
