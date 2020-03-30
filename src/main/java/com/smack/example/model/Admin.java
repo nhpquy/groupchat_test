@@ -9,6 +9,7 @@ import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration;
 import org.jivesoftware.smackx.muc.MultiUserChat;
 import org.jivesoftware.smackx.muc.MultiUserChatManager;
 import org.jivesoftware.smackx.muc.Occupant;
+import org.jivesoftware.smackx.ping.PingFailedListener;
 import org.jivesoftware.smackx.ping.PingManager;
 import org.jivesoftware.smackx.xdata.Form;
 import org.jxmpp.jid.EntityBareJid;
@@ -22,49 +23,51 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.text.DateFormat;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class Admin implements ConnectionListener {
+public class Admin implements ConnectionListener, ReconnectionListener, PingFailedListener {
 
     private static final Logger logger = LogManager.getLogger(Admin.class);
 
-    private static String host = "msg.beowulfchain.com";
-    private static int port = 443;
-    private static String service = "beowulfchain.com";
-    private static int connectionTimeout = 300000; //mills
-    private static int packageTimeout = 120000; //mills
-    private static int pingTimeout = 5; // seconds
-    public static String trackDir = "./track";
+    private static final String host = "msg.beowulfchain.com";
+    private static final int port = 443;
+    private static final String service = "beowulfchain.com";
+    private static final int connectionTimeout = 300000; //mills
+    private static final int packageTimeout = 120000; //mills
+    public static final String trackDir = "./track";
 
     private final Lock lock;
     private final Condition running;
-    private final AbstractXMPPConnection connection;
+
+    private AbstractXMPPConnection connection;
     private MultiUserChatManager multiUserChatManager;
     private PingManager pingManager;
+    private boolean reconnected;
 
     private String username;
     private String password;
     private String nickname;
 
     private List<RoomProperties> createdRooms;
-    private ConcurrentHashMap<String, MultiUserChat> groupChatsByRoomId;
-    private ConcurrentHashMap<String, BufferedWriter> trackersByRoomId;
+    private Map<String, MultiUserChat> groupChatsByRoomId;
+    private Map<String, BufferedWriter> trackersByRoomId;
 
-    private Timer timer;
+    private final ScheduledExecutorService timer;
 
     public Admin(String username, String password, String nickname, String roomsString) throws XmppStringprepException {
 
         lock = new ReentrantLock();
         running = lock.newCondition();
+        reconnected = false;
 
         this.username = username;
         this.password = password;
         this.nickname = nickname;
-
-        this.connection = new XMPPTCPConnection(initSmackConfig());
 
         // Load created rooms
         if (roomsString == null) {
@@ -73,14 +76,15 @@ public class Admin implements ConnectionListener {
             createdRooms = getCreatedRooms(roomsString);
         }
 
-        groupChatsByRoomId = new ConcurrentHashMap<>();
-        trackersByRoomId = new ConcurrentHashMap<>();
+        groupChatsByRoomId = new HashMap<>();
+        trackersByRoomId = new HashMap<>();
 
         File directory = new File(trackDir);
         if (!directory.exists()) {
             directory.mkdir();
         }
-        timer = new Timer();
+
+        timer = Executors.newSingleThreadScheduledExecutor();
     }
 
     private XMPPTCPConnectionConfiguration initSmackConfig() throws XmppStringprepException {
@@ -105,6 +109,8 @@ public class Admin implements ConnectionListener {
      */
     public void start() {
         try {
+            this.connection = new XMPPTCPConnection(initSmackConfig());
+
             if (connection.isConnected()) return;
 
             connection.setReplyTimeout(packageTimeout);
@@ -121,7 +127,6 @@ public class Admin implements ConnectionListener {
             connection.addConnectionListener(this);
 
             pingManager = PingManager.getInstanceFor(connection);
-            pingManager.setPingInterval(pingTimeout);
 
             ReconnectionManager reConnectManager = ReconnectionManager.getInstanceFor(connection);
             reConnectManager.enableAutomaticReconnection();
@@ -252,7 +257,7 @@ public class Admin implements ConnectionListener {
             } else {
                 try {
                     groupChat.join(Resourcepart.from(nickname), room.getPasscode());
-                    logger.info("\"{}\" joined room \"{}\"", nickname, room.getRoomId());
+                    logger.info("\"{}\" re-joined room \"{}\"", nickname, room.getRoomId());
                 } catch (Exception e) {
                     logger.error("Error joining room", e);
                 }
@@ -279,19 +284,16 @@ public class Admin implements ConnectionListener {
      * @param interval the interval time (ms)
      */
     private void setMessageScheduler(long interval) {
-        timer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                try {
-                    if (!isConnected()) return;
-                    DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
-                    String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
-                    sendMessageToAllGroups(message);
-                } catch (SmackException.NotConnectedException | InterruptedException ignored) {
-
-                }
+        timer.scheduleWithFixedDelay(() -> {
+            try {
+                if (!isConnected()) return;
+                DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
+                String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
+                sendMessageToAllGroups(message);
+            } catch (SmackException.NotConnectedException | InterruptedException e) {
+                logger.error("Error can not ping server");
             }
-        }, Calendar.getInstance().getTime(), interval);
+        }, interval, interval, TimeUnit.SECONDS);
     }
 
     private void sendMessageToAllGroups(String message) {
@@ -319,7 +321,7 @@ public class Admin implements ConnectionListener {
      *
      * @param roomId the id of room need to track
      */
-    private void createTracker(String roomId) {
+    public void createTracker(String roomId) {
         try {
             lock.lock();
             if (!trackersByRoomId.containsKey(roomId)) {
@@ -357,15 +359,13 @@ public class Admin implements ConnectionListener {
                 logger.error("Error when write chat record to file tracker");
                 e.printStackTrace();
             }
-        } else {
-            logger.debug(record);
         }
     }
 
     /**
      * Waits until the bot exits before returning
      */
-    public void waitForExit() {
+    public void beforeForExit() {
         lock.lock();
         try {
             connection.disconnect();
@@ -399,6 +399,9 @@ public class Admin implements ConnectionListener {
     @Override
     public void connected(XMPPConnection connection) {
         logger.info("Connected to server");
+        if (reconnected) {
+            createdRooms.forEach(this::joinRoom);
+        }
     }
 
     @Override
@@ -409,12 +412,28 @@ public class Admin implements ConnectionListener {
     @Override
     public void connectionClosed() {
         logger.info("Connection closed");
-        exit();
     }
 
     @Override
     public void connectionClosedOnError(Exception e) {
-        logger.error("Connection was closed because of an error", e);
+        logger.error("Connection was closed because of an error: " + e.getMessage());
+    }
+
+    @Override
+    public void reconnectingIn(int i) {
+        logger.info("Reconnecting in {} ...", i);
+        if (i == 0) reconnected = true;
+    }
+
+    @Override
+    public void reconnectionFailed(Exception e) {
+        logger.info("Reconnection failed! Error: {}", e.getMessage());
+    }
+
+    @Override
+    public void pingFailed() {
+        logger.info("The ping failed, restarting the ping interval again ...");
+        PingManager.getInstanceFor(connection);
     }
 
     public String getUsername() {
@@ -427,6 +446,10 @@ public class Admin implements ConnectionListener {
 
     public String getNickname() {
         return nickname;
+    }
+
+    public Map<String, MultiUserChat> getGroupChatsByRoomId() {
+        return groupChatsByRoomId;
     }
 
     public List<String> getMembers(String roomId) throws Exception {

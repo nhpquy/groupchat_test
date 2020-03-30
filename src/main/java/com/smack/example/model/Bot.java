@@ -10,6 +10,7 @@ import org.jivesoftware.smack.tcp.XMPPTCPConnection;
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration;
 import org.jivesoftware.smackx.muc.MultiUserChat;
 import org.jivesoftware.smackx.muc.MultiUserChatManager;
+import org.jivesoftware.smackx.ping.PingFailedListener;
 import org.jivesoftware.smackx.ping.PingManager;
 import org.jxmpp.jid.EntityBareJid;
 import org.jxmpp.jid.impl.JidCreate;
@@ -19,43 +20,46 @@ import org.jxmpp.stringprep.XmppStringprepException;
 import java.io.IOException;
 import java.text.DateFormat;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class Bot implements Runnable, ConnectionListener {
+public class Bot implements Runnable, ConnectionListener, ReconnectionListener, PingFailedListener {
 
     private Logger logger;
 
-    private static String host = "msg.beowulfchain.com";
-    private static int port = 443;
-    private static String service = "beowulfchain.com";
-    private static int connectionTimeout = 5000; //mills
-    private static int packageTimeout = 30000; //mills
-    private static int pingTimeout = 5; // seconds
-
+    private static final String host = "msg.beowulfchain.com";
+    private static final int port = 443;
+    private static final String service = "beowulfchain.com";
+    private static final int connectionTimeout = 5000; //mills
+    private static final int packageTimeout = 30000; //mills
+    private static final int pingInterval = 30; // seconds
 
     private final Lock lock;
     private final Condition running;
 
+    private boolean connected;
+    private boolean reconnected;
     private AbstractXMPPConnection connection;
     private MultiUserChatManager multiUserChatManager;
-    private PingManager pingManager;
 
     private String username;
     private String password;
     private String nickname;
 
     private List<RoomProperties> joinedRooms;
-    private ConcurrentHashMap<String, MultiUserChat> groupChatsByRoomId;
+    private Map<String, MultiUserChat> groupChatsByRoomId;
 
-    private Timer timer;
+    private final ScheduledExecutorService timer;
 
     public Bot(String username, String password, String nickname, String roomsString) {
 
         lock = new ReentrantLock();
         running = lock.newCondition();
+        connected = false;
 
         this.username = username;
         this.password = password;
@@ -70,8 +74,8 @@ public class Bot implements Runnable, ConnectionListener {
             joinedRooms = getJoinedRooms(roomsString);
         }
 
-        groupChatsByRoomId = new ConcurrentHashMap<>();
-        timer = new Timer();
+        groupChatsByRoomId = new HashMap<>();
+        timer = Executors.newSingleThreadScheduledExecutor();
     }
 
     private XMPPTCPConnectionConfiguration initSmackConfig() throws XmppStringprepException {
@@ -95,7 +99,7 @@ public class Bot implements Runnable, ConnectionListener {
     public void run() {
         logger.info("I'm " + nickname);
         start();
-        setMessageScheduler(5000L);
+        setMessageScheduler(5);
     }
 
     /**
@@ -112,13 +116,15 @@ public class Bot implements Runnable, ConnectionListener {
 
             connection.addConnectionListener(this);
 
-            pingManager = PingManager.getInstanceFor(connection);
-            pingManager.setPingInterval(pingTimeout);
+            PingManager pingManager = PingManager.getInstanceFor(connection);
+            pingManager.setPingInterval(pingInterval);
+            pingManager.registerPingFailedListener(this);
 
             ReconnectionManager reconnectionManager = ReconnectionManager.getInstanceFor(connection);
             reconnectionManager.enableAutomaticReconnection();
             reconnectionManager.setReconnectionPolicy(ReconnectionManager.ReconnectionPolicy.FIXED_DELAY);
             reconnectionManager.setFixedDelay(10);
+            reconnectionManager.addReconnectionListener(this);
 
             multiUserChatManager = MultiUserChatManager.getInstanceFor(connection);
 
@@ -161,10 +167,21 @@ public class Bot implements Runnable, ConnectionListener {
 
         if (connection.isAuthenticated())
             logger.info("Smack Message Client authenticated: username=" + username);
+
+        connected = true;
     }
 
-    private boolean isConnected() throws SmackException.NotConnectedException, InterruptedException {
-        return pingManager.pingMyServer();
+    private void updateStatus(boolean status) {
+        try {
+            lock.lock();
+            connected = status;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean isConnected() {
+        return connected;
     }
 
     /**
@@ -211,19 +228,12 @@ public class Bot implements Runnable, ConnectionListener {
      * @param interval the interval time (ms)
      */
     private void setMessageScheduler(long interval) {
-        timer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                try {
-                    if (!isConnected()) return;
-                    DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
-                    String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
-                    sendMessageToAllGroups(message);
-                } catch (SmackException.NotConnectedException | InterruptedException ignored) {
-
-                }
-            }
-        }, Calendar.getInstance().getTime(), interval);
+        timer.scheduleWithFixedDelay(() -> {
+            if (!isConnected()) return;
+            DateFormat dateTimeFormat = DateFormat.getDateTimeInstance();
+            String message = "Date: " + dateTimeFormat.format(Calendar.getInstance().getTime());
+            sendMessageToAllGroups(message);
+        }, interval, interval, TimeUnit.SECONDS);
     }
 
     /**
@@ -248,7 +258,8 @@ public class Bot implements Runnable, ConnectionListener {
         try {
             chat.sendMessage(message);
         } catch (SmackException.NotConnectedException | InterruptedException ex) {
-            logger.error("Error sending message to room {}", chat.getNickname(), ex);
+            logger.error("Error sending message to room {}", chat.getNickname());
+            connected = false;
         }
     }
 
@@ -269,24 +280,12 @@ public class Bot implements Runnable, ConnectionListener {
     /**
      * Waits until the bot exits before returning
      */
-    public void waitForExit() {
+    public void beforeForExit() {
         lock.lock();
         try {
+            timer.shutdown();
             connection.disconnect();
             logger.info("Exit successful");
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Tell the bot to shutdown.
-     * This will cause the call to waitForExit to return.
-     */
-    public void exit() {
-        lock.lock();
-        try {
-            running.signal();
         } finally {
             lock.unlock();
         }
@@ -295,23 +294,46 @@ public class Bot implements Runnable, ConnectionListener {
     @Override
     public void connected(XMPPConnection connection) {
         logger.info("Connected to server");
-        joinedRooms.forEach(this::joinRoom);
+        connected = true;
+        if (reconnected) {
+            joinedRooms.forEach(this::joinRoom);
+        }
     }
 
     @Override
     public void authenticated(XMPPConnection xmppConnection, boolean b) {
         logger.info("Authentication successful");
+        connected = true;
     }
 
     @Override
     public void connectionClosed() {
         logger.info("Connection closed");
-        exit();
+        connected = false;
     }
 
     @Override
     public void connectionClosedOnError(Exception e) {
         logger.error("Connection was closed because of an error: " + e.getMessage());
+        connected = false;
+    }
+
+    @Override
+    public void reconnectingIn(int i) {
+        logger.info("Reconnecting in {} ...", i);
+        if (i == 0) reconnected = true;
+    }
+
+    @Override
+    public void reconnectionFailed(Exception e) {
+        logger.info("Reconnection failed! Error: {}", e.getMessage());
+    }
+
+    @Override
+    public void pingFailed() {
+        logger.info("The ping failed, restarting the ping interval again ...");
+        PingManager pingManager = PingManager.getInstanceFor(connection);
+        pingManager.setPingInterval(pingInterval);
     }
 
     public String getUsername() {

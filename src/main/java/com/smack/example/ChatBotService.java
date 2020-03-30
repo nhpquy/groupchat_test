@@ -42,10 +42,13 @@ public class ChatBotService {
     }
 
     private void init() throws XmppStringprepException {
-        admin = new Admin("25251325", "123456789", "Admin", null);
+        admin = new Admin("25251325", defaultPwd, "Admin", null);
         admin.start();
 
         bots = new ArrayList<>();
+        bots.add(new Bot("CpAP", defaultPwd, "bot0", null));
+        bots.get(0).run();
+
         generateBots(10);
     }
 
@@ -77,7 +80,7 @@ public class ChatBotService {
     private void generateBots(int numberOfMembers) {
         while (bots.size() < numberOfMembers) {
             registerChatAccount(String.format("bot%d", bots.size()));
-            bots.get(bots.size() - 1).run();
+            if (bots.size() > 0) bots.get(bots.size() - 1).run();
         }
     }
 
@@ -102,12 +105,12 @@ public class ChatBotService {
         for (int i = 0; i < numberOfMembers; i++) {
             int finalI = i;
             Runnable joinRoomTask = () -> bots.get(finalI).joinRoom(newRoom);
-            botPool.execute(joinRoomTask);
+            botPool.submit(joinRoomTask);
         }
         System.out.println("Created room with ID: " + roomId + "successfully");
     }
 
-    public void inviteToNewConference(int numberOfMembers, String roomId, String password, boolean needTrack) {
+    public void inviteToConference(int numberOfMembers, String roomId, String password, boolean needTrack, boolean alreadyExist) {
 
         generateBots(numberOfMembers);
 
@@ -117,7 +120,17 @@ public class ChatBotService {
                 admin.getNickname()
         );
 
-        MultiUserChat currentRoom = admin.createRoom(newRoom, needTrack);
+        MultiUserChat currentRoom = null;
+        if (alreadyExist) {
+            admin.joinRoom(newRoom);
+            if (!admin.getCreatedRooms().contains(newRoom)) admin.getCreatedRooms().add(newRoom);
+            currentRoom = admin.getGroupChatsByRoomId().get(roomId);
+            if (needTrack) {
+                admin.createTracker(roomId);
+            }
+        } else {
+            currentRoom = admin.createRoom(newRoom, needTrack);
+        }
 
         if (currentRoom == null) {
             return;
@@ -127,8 +140,9 @@ public class ChatBotService {
 
         for (int i = 0; i < numberOfMembers; i++) {
             int finalI = i;
-            Runnable inviteTask = () -> admin.sendInvitation(currentRoom, bots.get(finalI).userIdToJid(), "join");
-            botPool.execute(inviteTask);
+            MultiUserChat finalCurrentRoom = currentRoom;
+            Runnable inviteTask = () -> admin.sendInvitation(finalCurrentRoom, bots.get(finalI).userIdToJid(), "join");
+            botPool.submit(inviteTask);
         }
 
         System.out.println("Created room with ID: " + roomId + "successfully");
@@ -136,10 +150,10 @@ public class ChatBotService {
 
     private static void onDestroy() {
         try {
-            admin.waitForExit();
+            admin.beforeForExit();
 
             for (Bot bot : bots) {
-                bot.waitForExit();
+                bot.beforeForExit();
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -153,7 +167,7 @@ public class ChatBotService {
 
         System.out.println("\n");
         System.out.println("- [-create <passcode> <number of members>] - create new room with your passcode");
-        System.out.println("- [-invite <passcode> <number of members>] - invite list user to new room with your passcode");
+        System.out.println("- [-invite <passcode> <number of members> <room id>] - invite list user to new room with your passcode");
         System.out.println("- [-rooms] - list rooms");
         System.out.println("- [exit] - exit");
 
@@ -181,10 +195,11 @@ public class ChatBotService {
                 int numberOfMembers = (params.length >= 3) ? Integer.parseInt(params[2]) : 100;
                 service.createNewConference(numberOfMembers, roomId, passcode, true);
             } else if ("-invite".equals(params[0])) {
-                String roomId = String.valueOf(System.currentTimeMillis());
                 String passcode = (params.length >= 2) ? params[1] : "1234";
                 int numberOfMembers = (params.length >= 3) ? Integer.parseInt(params[2]) : 100;
-                service.inviteToNewConference(numberOfMembers, roomId, passcode, true);
+                String roomId = (params.length >= 4) ? params[3] : String.valueOf(System.currentTimeMillis());
+                boolean existRoom = params.length >= 4;
+                service.inviteToConference(numberOfMembers, roomId, passcode, true, existRoom);
             }
         }
     }
